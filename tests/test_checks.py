@@ -53,3 +53,12 @@ def test_facts_to_verify():
 
 def test_ordinary_text_has_no_facts():
     assert check_facts_to_verify(GOOD_EN) == []
+
+
+def test_fact_snippets_show_the_whole_value():
+    snippets = [f.snippet for f in check_facts_to_verify("Tickets cost €25.50 per person, or 100 zł.")]
+    assert snippets == ["€25.50", "100 zł"]
+
+
+def test_plain_numbers_are_not_facts():
+    assert check_facts_to_verify("We have 2 hours. Built in 1226, 600 years ago.") == []

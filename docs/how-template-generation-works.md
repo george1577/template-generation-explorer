@@ -271,8 +271,53 @@ It's a quick way to see which templates will need the most attention in review.
 
 ## 5. Tab ③: Review
 
-This is the step that makes the pattern safe. A person reads each template and makes one of
-three decisions:
+This is the step that makes the pattern safe. Before reading the details, here is the most
+important fact about it:
+
+> **No LLM is involved in review.** The app's automatic checks are four fixed rules written in
+> plain Python (`templategen/checks.py`): pattern matching and word counting. They **point at**
+> likely problems. A **person** makes every decision.
+
+### 5.1 Who does what
+
+| Who | What it does | Can it approve or reject? |
+|---|---|---|
+| The LLM | Nothing. It wrote the template in tab ① or ②, and it isn't called again here (unless you click 🔁 Regenerate, which writes a *new* template). | No |
+| The automatic checks (hard-coded rules) | Read the template and list **findings**: "this placeholder is missing", "this looks like a price". | **No.** They never change a template's status. |
+| The reviewer (a person) | Reads the template and the findings, then clicks ✅ Approve, ❌ Reject, ✏️ Edit or 🔁 Regenerate. | **Yes. Only the person.** |
+
+```mermaid
+flowchart LR
+    T["Template text<br/>(written earlier by the LLM)"] --> C["4 automatic checks<br/>plain Python rules, no LLM"]
+    C --> F["Findings<br/>🛑 errors, 🔎 facts to verify<br/>(or none)"]
+    T --> P{"Reviewer<br/>(a person)"}
+    F --> P
+    P -- "✅ approve" --> A["approved:<br/>can be sent"]
+    P -- "❌ reject" --> R["rejected"]
+    P -- "✏️ edit" --> E["pending again"]
+    R -- "🔁 regenerate (LLM writes a new one)" --> E
+```
+
+#### Why not let an LLM do the checking?
+
+It's tempting: "ask a second LLM whether the letter is OK". The app deliberately doesn't, for
+three reasons:
+
+1. **The same weaknesses.** The problem we're guarding against is an LLM confidently writing
+   something wrong. A checker LLM can be confidently wrong in the same way: it might "verify"
+   that Europe's longest urban zipline really is in Toledo.
+2. **Rules give the same answer every time.** The same template gets the same findings, today
+   and next year. You can read the rule and know exactly why something was flagged. An LLM
+   checker can flag a template on one run and pass it on the next.
+3. **The pattern's promise is "a person approved this".** A second LLM can't make that promise.
+
+An LLM-based reviewer *can* be a useful extra helper. That's a separate design pattern
+(*LLM-as-Judge*, pattern 17 in the book). Even then it would sit where the rules sit here,
+pointing at problems, never taking the person's place.
+
+### 5.2 The status rules
+
+Every template has exactly one status. These are all the ways it can change:
 
 ```mermaid
 stateDiagram-v2
@@ -292,23 +337,81 @@ Only **approved** templates can be used in tab ④. Two rules may look strict, b
   promise would break.
 - **Regenerating starts again at pending**, because it's brand-new text.
 
-### Automatic checks: help, not a decision
+Note what's **not** in the diagram: no arrow is labelled "checks passed". A template with zero
+findings stays ⏳ pending until a person approves it. The app also lets a person approve a template
+that has findings: it shows a warning when there are 🛑 errors, but it doesn't block the button,
+because a person may have a good reason (for example, the 🔎 meeting time is correct).
 
-Reading 24 letters carefully is tiring, so the app runs four **automatic checks** on each
-template and points at likely problems. They **never** approve or reject anything themselves:
-a template with no findings still needs a person to say yes, and a person may approve a
-template with findings (say, an opening time they checked is correct).
+### 5.3 The automatic checks, rule by rule
 
-There are two severities:
+All four checks run every time a template is shown in this tab (and in tab ①, and again
+whenever you change the text in the ✏️ edit box and click outside it). Each one takes the template text and returns a list of
+**findings**. A finding has four parts:
 
-- 🛑 **error**: the template can't be filled correctly as it stands. Fix it or regenerate it.
-- 🔎 **verify**: there's a fact a person must check before approving.
+| Part | Example |
+|---|---|
+| check | `missing placeholder` |
+| severity | 🛑 `error` (the template can't be filled correctly as it stands), or 🔎 `verify` (a person must check a fact) |
+| found | the exact text that triggered it, e.g. `[DATE]` or `9:30` |
+| what it means | a plain-English message for the reviewer |
+
+"**Passing**" a check just means it returned no findings. The app runs them in this order and
+joins the lists together:
+
+```python
+def run_checks(text: str, expected_language: str) -> list[Finding]:
+    return (
+        check_missing_placeholders(text)        # (a)
+        + check_unknown_placeholders(text)      # (b)
+        + check_language(text, expected_language)  # (c)
+        + check_facts_to_verify(text)           # (d)
+    )
+```
+
+Checks (a) and (b) both rely on one helper that finds **anything in square brackets**:
+
+```python
+BRACKETED = re.compile(r"\[[^\[\]\n]{1,40}\]")
+```
+
+Reading that pattern piece by piece:
+
+| Piece | Meaning |
+|---|---|
+| `\[` | a literal `[` |
+| `[^\[\]\n]{1,40}` | 1 to 40 characters that are not `[`, `]` or a line break |
+| `\]` | a literal `]` |
+
+So it matches `[CUSTOMER_NAME]`, `[DATE]`, `[Your Name]` and `[IMIĘ_KLIENTA]`, but not `[]`
+(empty), and not brackets spread across two lines. Run on our Toledo template, it returns:
+
+```text
+['[CUSTOMER_NAME]', '[TOUR_GUIDE]', '[TOUR_GUIDE]']
+```
+
+---
 
 #### Check (a): missing placeholder 🛑
 
-Does the template contain **both** `[CUSTOMER_NAME]` and `[TOUR_GUIDE]`?
+**Question:** does the template contain **both** `[CUSTOMER_NAME]` and `[TOUR_GUIDE]`?
 
-*Example.* The model writes:
+**Rule:**
+
+1. Find every bracketed placeholder in the text (the helper above).
+2. For each of the two required placeholders, if it isn't among them, report it.
+
+```python
+def check_missing_placeholders(text):
+    found = set(find_placeholders(text))
+    return [Finding("missing placeholder", ERROR, f"{p} never appears, ...", p)
+            for p in PLACEHOLDERS          # ["[CUSTOMER_NAME]", "[TOUR_GUIDE]"]
+            if p not in found]
+```
+
+**Worked example: pass.** Toledo template → found = `{[CUSTOMER_NAME], [TOUR_GUIDE]}`. Both
+required placeholders are present → **no findings**.
+
+**Worked example: fail.** The model writes:
 
 ```text
 Dear valued guest,
@@ -317,15 +420,48 @@ Warm regards,
 Your Tours GenAI guide
 ```
 
-Finding: *"[CUSTOMER_NAME] never appears, so that detail can't be filled in."* and the same for
-`[TOUR_GUIDE]`. Every customer would get "Dear valued guest". The letter isn't wrong, but it
-isn't personal, which was the whole point.
+found = `{}` (empty) → two findings:
+
+| | check | found | what it means |
+|---|---|---|---|
+| 🛑 | missing placeholder | `[CUSTOMER_NAME]` | [CUSTOMER_NAME] never appears, so that detail can't be filled in. |
+| 🛑 | missing placeholder | `[TOUR_GUIDE]` | [TOUR_GUIDE] never appears, so that detail can't be filled in. |
+
+Every customer would get "Dear valued guest". The letter isn't wrong, but it isn't personal,
+which was the whole point.
+
+**Limits:** it checks that each placeholder appears *at least once*, not that it's used
+sensibly. "Let us welcome in [TOUR_GUIDE]" passes (see the Escorial example below).
+
+---
 
 #### Check (b): unknown placeholder 🛑
 
-Is there anything in square brackets that **isn't** one of our two placeholders?
+**Question:** is there anything in square brackets that **isn't** one of our two placeholders?
 
-*Example.* Small models like to invent their own blanks, or translate ours:
+**Rule:**
+
+1. Find every bracketed piece of text.
+2. Keep the ones that aren't `[CUSTOMER_NAME]` or `[TOUR_GUIDE]`.
+3. Report each one once, even if it appears several times.
+
+```python
+def check_unknown_placeholders(text):
+    unknown = []
+    for p in find_placeholders(text):
+        if p not in PLACEHOLDERS and p not in unknown:
+            unknown.append(p)
+    return [Finding("unknown placeholder", ERROR, f"{p} is not one we know how to fill; ...", p)
+            for p in unknown]
+```
+
+**Why it matters:** at send time, fill replaces only the placeholders it knows. Anything else in
+brackets is left as it is and reaches the customer word for word.
+
+**Worked example: pass.** Toledo template → bracketed = `[CUSTOMER_NAME]`, `[TOUR_GUIDE]`,
+`[TOUR_GUIDE]` → all known → **no findings**.
+
+**Worked example: fail.** Small models like to invent their own blanks, or translate ours:
 
 ```text
 Szanowny [IMIĘ_KLIENTA],
@@ -333,58 +469,177 @@ Do zobaczenia [DATE]!
 [Your Name]
 ```
 
-Findings: `[IMIĘ_KLIENTA]`, `[DATE]` and `[Your Name]` are not placeholders we know how to fill.
-(Check (a) also fires here, since the real `[CUSTOMER_NAME]` and `[TOUR_GUIDE]` are now missing.)
-If this template were sent, customers would literally read *"Do zobaczenia [DATE]!"*.
+bracketed = `[IMIĘ_KLIENTA]`, `[DATE]`, `[Your Name]` → none are known → five findings in total,
+because check (a) also fires (the real placeholders are now missing):
 
-How it works: the app looks for any short piece of text between `[` and `]` on one line
-(the regular expression `\[[^\[\]\n]{1,40}\]`) and compares each match against the list of
-known placeholders.
+| | check | found |
+|---|---|---|
+| 🛑 | missing placeholder | `[CUSTOMER_NAME]` |
+| 🛑 | missing placeholder | `[TOUR_GUIDE]` |
+| 🛑 | unknown placeholder | `[IMIĘ_KLIENTA]` |
+| 🛑 | unknown placeholder | `[DATE]` |
+| 🛑 | unknown placeholder | `[Your Name]` |
+
+If this template were sent, customers would literally read *"Do zobaczenia [DATE]!"* ("See you
+on [DATE]!").
+
+**Limits:** it only knows about square brackets. A model that writes `{name}` or `<NAME>` instead
+won't trigger (b), though check (a) will still notice that `[CUSTOMER_NAME]` is missing.
+
+---
 
 #### Check (c): wrong language 🛑
 
-Is the template written in the language its key asks for?
+**Question:** is the template written in the language its key asks for?
 
-The app makes a quick guess by counting:
+There's no translation model here, just counting. The rule, step by step:
 
-- **English evidence**: how many words are very common English words (*the, and, you, your, will, with, ...*);
-- **Polish evidence**: how many words are very common Polish words (*na, się, jest, będzie, bardzo, ...*),
-  plus a bonus for letters that only Polish uses (*ą ć ę ł ń ó ś ź ż*), each worth 10 times as much
-  because they're very strong evidence.
+1. **Remove placeholders.** `[CUSTOMER_NAME]` is English in every template, Polish ones included.
+2. **Split the text into words** (runs of letters), all in lowercase.
+3. **English score** = (number of words found in the English list) ÷ (total words).
+4. **Polish score** = (number of words found in the Polish list) ÷ (total words)
+   **+ 10 ×** (number of Polish-only letters) ÷ (total characters).
+5. **Guess** = whichever score is higher (English wins a tie).
+6. If the guess isn't the language the key asked for → report it.
 
-Placeholders are removed first, because `[CUSTOMER_NAME]` is English in every template. Short words
-that exist in both languages (Polish *i* "and" vs English *I*, or *to*) are left out of the Polish
-list, otherwise every "I'm" would count as Polish.
+The lists, exactly as they are in the code:
 
-*Example.* For our Toledo English template, roughly 1 in 4 words is a common English word and
-there are no Polish letters, so the scores are `English 0.289, Polish 0.0` → **English** ✔.
-If the key says **Polish** and the model answered in English anyway (small models sometimes do),
-you'd see: *"Asked for Polish, but this reads like English (English score 0.289, Polish score 0.0)."*
+| List | Contents |
+|---|---|
+| Common English words (20) | the, and, you, your, to, of, is, will, we, with, for, this, are, be, in, can, see, our, it, that |
+| Common Polish words (21) | na, się, nie, jest, że, jak, dla, oraz, będzie, który, która, nas, pan, pani, bardzo, państwa, czy, ale, już, tym, jestem |
+| Polish-only letters (9, plus capitals) | ą ć ę ł ń ó ś ź ż |
 
-It's a heuristic, not a translator. It can't tell good Polish from clumsy Polish. That's still
-the reviewer's job.
+Two design choices are worth explaining:
+
+- **Why × 10 for Polish letters?** Words are counted per *word*, but letters are counted per
+  *character*, and there are about 6 times as many characters as words. A Polish-only letter is
+  also very strong evidence: English text almost never contains `ł` or `ę`. Multiplying by 10
+  puts the two kinds of evidence on a similar scale.
+- **Why are some common Polish words missing?** *i* ("and"), *w* ("in"), *z* ("with"), *do* ("to")
+  and *to* ("it/this") are very common in Polish, but they also look like English words. Every
+  English "I'm" would count as the Polish *i*. So they're left out.
+
+**Worked example: English template (seed, Toledo / Family / English).**
+
+| | Count |
+|---|---|
+| Words (after removing placeholders) | 312 |
+| Characters | 1,905 |
+| Words in the English list | 84 (*the* × 19, *to* × 9, *of* × 8, *and* × 7, *for* × 6, *you* × 5, …) |
+| Words in the Polish list | 0 |
+| Polish-only letters | 0 |
+
+- English score = 84 ÷ 312 = **0.269**
+- Polish score = 0 ÷ 312 + 10 × 0 ÷ 1,905 = **0.0**
+- 0.269 > 0.0 → guess **English**. The key asked for English → **no finding** ✔
+
+**Worked example: Polish template (seed, Toledo / Family / Polish).**
+
+| | Count |
+|---|---|
+| Words | 171 |
+| Characters | 1,252 |
+| Words in the English list | 3 (the Polish word *to*, which happens to be on the English list) |
+| Words in the Polish list | 21 (*na* × 6, *się* × 5, *już* × 2, *dla* × 2, *że* × 2, …) |
+| Polish-only letters | 75 (*ę* × 19, *ł* × 14, *ą* × 13, *ż* × 10, *ó* × 7, …) |
+
+- English score = 3 ÷ 171 = **0.018**
+- Polish score = 21 ÷ 171 + 10 × 75 ÷ 1,252 = 0.123 + 0.599 = **0.722**
+- 0.722 > 0.018 → guess **Polish**. The key asked for Polish → **no finding** ✔
+
+Notice that most of the Polish score comes from the letters (0.599), not the words (0.123).
+That's the × 10 at work.
+
+**Worked example: fail.** Suppose a small model ignores "in Polish" and writes the English letter
+above for the **Polish** key. The scores are the same (English 0.269, Polish 0.0), the guess is
+English, the key says Polish, so:
+
+| | check | what it means |
+|---|---|---|
+| 🛑 | wrong language | Asked for Polish, but this reads like English (English score 0.269, Polish score 0.0). |
+
+**Limits:** it tells English from Polish, nothing more. It can't tell good Polish from broken
+Polish (the Escorial example below passes easily), and it can't detect a letter that switches
+language halfway, as long as the expected language still wins overall.
+
+---
 
 #### Check (d): facts to verify 🔎
 
-Does the template mention something the model might have **made up**, which would cause real
-trouble if it's wrong?
+**Question:** does the template mention a specific fact the model might have **made up**, one
+that would cause real trouble if it's wrong?
 
-| Kind | Examples the check finds |
+The model knows nothing about *your* prices, schedule or contact details. If it writes "We meet at
+9:00" or "Tickets are €25", it's guessing. So this check looks for five kinds of specific fact,
+each with a fixed pattern:
+
+| Kind | What the rule looks for | Matches | Doesn't match |
+|---|---|---|---|
+| price | a currency sign before a number, or a number before a currency word | `€25`, `€25.50`, `$30`, `45 euros`, `200 zł`, `10 PLN` | `a small fee` |
+| time | `H:MM` or `H.MM`, optionally with am/pm; or a number followed by am/pm | `9:30`, `14.00`, `9:00 am`, `10 pm` | `2 hours` |
+| date | a day number and a month name (English or Polish), or `D/M` | `12 May`, `May 12`, `3rd June`, `3 maja`, `12/05` | `in May`, `the 13th century` |
+| phone number | 9 or more digits, allowing spaces and dashes, optional `+` | `+34 912 345 678`, `912-345-678` | `1226` |
+| web or email address | `http(s)://…`, `www.…`, or `something@something.something` | `https://toursgenai.es`, `www.toursgenai.es`, `info@toursgenai.es` | `toursgenai` |
+
+One extra rule: the five patterns run in the order above, and **text already flagged by an
+earlier pattern is skipped by later ones**. Without that, `€25.50` would be reported twice: once
+as a price, and again as the time `25.50`.
+
+These are real outputs of the check:
+
+| Sentence | Findings |
 |---|---|
-| price | `€45`, `45 euros`, `200 zł`, `$30` |
-| time | `9:30`, `10 am`, `14.00` |
-| date | `12 May`, `May 12`, `3 maja`, `12/05` |
-| phone number | `+34 912 345 678` |
-| web or email address | `https://...`, `www....`, `info@...` |
+| "Tickets cost €25.50 per person, or 100 zł." | 🔎 price `€25.50`, 🔎 price `100 zł` |
+| "We meet at 9:30 at the gate." | 🔎 time `9:30` |
+| "See you on 12 May!" | 🔎 date `12 May` |
+| "Call +34 912 345 678." | 🔎 phone number `+34 912 345 678` |
+| "Visit www.toursgenai.es" | 🔎 web or email address `www.toursgenai.es` |
+| "We have 2 hours." | (none) |
+| "Built in 1226, 600 years ago." | (none) |
 
-*Example.* The model writes *"We'll meet at 9:00 am at the Plaza de Zocodover."* Finding:
-🔎 *"Mentions a time. The model may have made it up; check it's correct."* with `9:00 am`
-shown. The model doesn't know your schedule. If the real meeting time is 10:30, a reviewer
-should fix that sentence or remove it.
+Each finding says: *"Mentions a {kind}. The model may have made it up; check it's correct."*
 
-Our Toledo example has no prices, times, dates, numbers or links, so check (d) finds nothing.
+**Why 🔎 and not 🛑?** A price or time isn't automatically wrong. If the reviewer confirms the
+tour really starts at 9:30, they approve the template as it is. The finding just makes sure they
+*looked*.
 
-### Things the checks can't catch
+**Worked example.** Both Toledo seed templates (English and Polish) mention no prices, times,
+dates, phone numbers or links → **no findings**.
+
+**Limits:** it catches *formats*, not *claims*. "Europe's longest urban zipline" and "lunch is
+included" contain no numbers, so they pass. Those need a person (next section).
+
+---
+
+#### All the rules on one page
+
+| # | Check | Severity | Flags when… | Found by |
+|---|---|---|---|---|
+| a | missing placeholder | 🛑 error | `[CUSTOMER_NAME]` or `[TOUR_GUIDE]` never appears | bracket pattern + list comparison |
+| b | unknown placeholder | 🛑 error | anything else appears in `[square brackets]` | bracket pattern + list comparison |
+| c | wrong language | 🛑 error | the other language scores higher than the one the key asked for | word lists + Polish-letter count |
+| d | fact to verify | 🔎 verify | a price, time, date, phone number or web/email address appears | 5 regular expressions |
+
+None of them uses an LLM, the network, or randomness. Run them twice on the same text and you get
+the same findings. You can run them yourself:
+
+```bash
+uv run python -c "
+from templategen.checks import run_checks
+for f in run_checks('Dear [NAME], we meet at 9:30!', 'English'):
+    print(f.severity, f.check, f.snippet)
+"
+```
+
+```text
+error missing placeholder [CUSTOMER_NAME]
+error missing placeholder [TOUR_GUIDE]
+error unknown placeholder [NAME]
+verify fact to verify 9:30
+```
+
+### 5.4 Things the checks can't catch
 
 Look again at our Toledo template. All four checks pass. But a careful reviewer might still ask:
 
@@ -394,8 +649,8 @@ Look again at our Toledo template. All four checks pass. But a careful reviewer 
 
 No simple rule can know what's on your itinerary. **That's why the final decision belongs to a
 person.** If the synagogue isn't on the route, the reviewer opens **✏️ Edit the text**, deletes
-that bullet, and saves. The template goes back to ⏳ pending (the checks re-run on the edit as you
-type), and then they approve it.
+that bullet, and saves. The template goes back to ⏳ pending (the checks re-run on your edited
+text), and then they approve it.
 
 #### A real example from the bundled seed
 
@@ -456,7 +711,7 @@ This is the clearest argument for the pattern. If this letter had been written b
 generation**, it would have gone to a real customer, because the automatic checks didn't catch it.
 With templates, one person reads it once, rejects it, and no customer ever sees it.
 
-### Doing the review in the app
+### 5.5 Doing the review in the app
 
 1. Choose **Show: pending** to see what's left.
 2. Pick a template. Templates with errors show `🛑N` next to their name.

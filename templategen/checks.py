@@ -73,7 +73,7 @@ ENGLISH_WORDS = {
 # "I'm" would otherwise count as the Polish word "i".
 POLISH_WORDS = {
     "na", "się", "nie", "jest", "że", "jak", "dla", "oraz", "będzie", "który", "która",
-    "nas", "pan", "pani", "bardzo", "państwa", "się", "czy", "ale", "już", "tym", "jestem",
+    "nas", "pan", "pani", "bardzo", "państwa", "czy", "ale", "już", "tym", "jestem",
 }
 WORD = re.compile(r"[^\W\d_]+", re.UNICODE)
 
@@ -118,7 +118,7 @@ MONTHS = (
     r"listopada|grudnia"
 )
 FACT_PATTERNS: list[tuple[str, re.Pattern]] = [
-    ("price", re.compile(r"[€$£]\s?\d|\d[\d.,]*\s?(?:€|EUR|euros?|USD|dollars?|zł|PLN)\b", re.I)),
+    ("price", re.compile(r"[€$£]\s?\d[\d.,]*|\d[\d.,]*\s?(?:€|EUR|euros?|USD|dollars?|zł|PLN)\b", re.I)),
     ("time", re.compile(r"\b\d{1,2}[:.]\d{2}\s?(?:am|pm|a\.m\.|p\.m\.)?|\b\d{1,2}\s?(?:am|pm|a\.m\.|p\.m\.)", re.I)),
     ("date", re.compile(rf"\b\d{{1,2}}(?:st|nd|rd|th)?\s(?:{MONTHS})\b|\b(?:{MONTHS})\s\d{{1,2}}\b|\b\d{{1,2}}/\d{{1,2}}(?:/\d{{2,4}})?\b", re.I)),
     ("phone number", re.compile(r"\+?\d[\d \-]{7,}\d")),
@@ -127,9 +127,16 @@ FACT_PATTERNS: list[tuple[str, re.Pattern]] = [
 
 
 def check_facts_to_verify(text: str) -> list[Finding]:
+    """Rules run in the order of FACT_PATTERNS. Text already flagged by an earlier rule is
+    skipped by later ones, so "€25.50" is reported once as a price, not again as the time "25.50".
+    """
     findings = []
+    taken: list[tuple[int, int]] = []
     for kind, pattern in FACT_PATTERNS:
         for match in pattern.finditer(text):
+            if any(match.start() < end and start < match.end() for start, end in taken):
+                continue
+            taken.append(match.span())
             findings.append(
                 Finding(
                     "fact to verify",
